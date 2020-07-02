@@ -219,10 +219,8 @@ parameters:
   {{role.name}}AnyErrorsFatal:
     default: yes
     type: string
-  {#- We generally won't want any failures on HA Controller roles, 15% will cause any 1 node to fail the deploy, #}
-  {#- for a 3 or 5 node Role, making it a fairly safe default. #}
   {{role.name}}MaxFailPercentage:
-    default: 15
+    default: 0
     type: number
   {{role.name}}Count:
     description: Number of {{role.name}} nodes to deploy
@@ -271,6 +269,11 @@ parameters:
   {{role.name}}Parameters:
     type: json
     description: Optional Role Specific parameters to be provided to service
+    default: {}
+
+  {{role.name}}ExtraGroupVars:
+    type: json
+    description: Optional extra Ansible group vars
     default: {}
 {% endfor %}
 
@@ -399,11 +402,10 @@ resources:
   VipHosts:
     type: OS::Heat::Value
     properties:
-      type: string
+      type: json
       value:
-        list_join:
-        - "\n"
-        - - str_replace:
+        entries:
+          - str_replace:
               template: IP  HOST
               params:
                 IP: {get_attr: [VipMap, net_ip_map, ctlplane]}
@@ -544,6 +546,7 @@ resources:
       ServiceNetMap: {get_attr: [ServiceNetMap, service_net_map]}
       ServiceData:
         net_cidr_map: {get_attr: [NetCidrMapValue, value]}
+        net_vip_map: {get_attr: [VipMap, net_ip_map]}
       EndpointMap: {get_attr: [EndpointMapData, value]}
       DefaultPasswords: {get_attr: [DefaultPasswords, passwords]}
       RoleName: {{role.name}}
@@ -588,6 +591,7 @@ resources:
           - '"%{::uuid}"'
           - fqdn
           - docker_puppet # Optionally provided by container-puppet.py
+          - ansible_managed
           - heat_config_%{::deploy_config_name}
           - config_step
           - role_extraconfig
@@ -659,12 +663,13 @@ resources:
     type: OS::TripleO::Network::Ports::NetIpListMap
     properties:
       ControlPlaneIpList: {get_attr: [{{role.name}}, ip_address]}
-  {%- for network in networks %}
-    {%- if network.enabled|default(true) and network.name in role.networks|default([]) %}
+  {%- for network in networks if network.enabled|default(true) and network.name in role.networks|default([]) %}
       {{network.name}}IpList: {get_attr: [{{role.name}}, {{network.name_lower}}_ip_address]}
-    {%- else %}
-      {{network.name}}IpList: {get_attr: [{{role.name}}, ip_address]}
-    {%- endif %}
+  {%- endfor %}
+      RoleNetworks:
+        - ctlplane
+  {%- for network in networks if network.enabled|default(true) and network.name in role.networks|default([]) %}
+        - {{network.name_lower}}
   {%- endfor %}
       EnabledServices: {get_attr: [{{role.name}}ServiceNames, value]}
       ServiceNetMap: {get_attr: [ServiceNetMap, service_net_map_lower]}
@@ -789,34 +794,31 @@ resources:
             for_each:
               hostname: {get_param: DeploymentServerBlacklist}
 
+  # Single value comma delimited lists may be stored in strings
+  # that fails lists concat. Make them always lists (nested are OK)
   HostsValue:
     type: OS::Heat::Value
     properties:
+      type: json
       value:
-        list_join:
-        - "\n"
-        - {get_param: UndercloudHostsEntries}
-        - - if:
-            - add_vips_to_etc_hosts
-            - {get_attr: [VipHosts, value]}
-            - ''
-        -
+        entries:
+            - - {get_param: UndercloudHostsEntries}
+            - - if:
+                - add_vips_to_etc_hosts
+                - {get_attr: [VipHosts, value, entries]}
+                - []
 {%- for role in roles %}
-          - list_join:
-            - ""
-            - {get_attr: [{{role.name}}, hosts_entry]}
+            - {get_attr: [{{role.name}}, hosts_entry, entries]}
 {%- endfor %}
-        - {get_param: ExtraHostFileEntries}
+            - - {get_param: ExtraHostFileEntries}
 
   HostsEntryValue:
     type: OS::Heat::Value
     properties:
       value:
-        list_join:
-          - ' '
-          - str_split:
-            - '\n'
-            - {get_attr: [HostsValue, value]}
+        yaql:
+          expression: coalesce($.data, []).where($ != null).where($ != []).flatten().distinct()
+          data: {get_attr: [HostsValue, value, entries]}
 
   CloudNames:
     type: OS::Heat::Value
@@ -910,6 +912,8 @@ resources:
             data: {get_attr: [Networks, net_cidr_map, {{network.name_lower}}]}
         {% endif %}
         {% endfor %}
+        service_metadata_settings: {get_attr: [{{role.name}}ServiceChainRoleData, value, service_metadata_settings]}
+
 {% endfor %}
 
   ControlVirtualIP:
@@ -1121,6 +1125,18 @@ resources:
           - redis: {get_attr: [RedisVirtualIP, ip_address]}
           - ovn_dbs: {get_attr: [OVNDBsVirtualIP, ip_address]}
       CloudNames: {get_attr: [CloudNames, value]}
+      UndercloudHostsEntries: {get_param: UndercloudHostsEntries}
+      ExtraHostsEntries: {get_param: ExtraHostFileEntries}
+      VipHostsEntries:
+        if:
+          - add_vips_to_etc_hosts
+          - {get_attr: [VipHosts, value, entries]}
+          - []
+      KeystoneResourcesConfigs:
+        map_merge:
+{% for role in roles %}
+          - get_attr: [{{role.name}}ServiceChainRoleData, value, keystone_resources]
+{% endfor %}
 
 outputs:
   ManagedEndpoints:
@@ -1149,10 +1165,9 @@ outputs:
       hostname-based access to the deployed nodes (useful for testing without
       setting up a DNS).
     value:
-      list_join:
-      - "\n"
-      - - {get_attr: [HostsEntryValue, value]}
-      - - {get_attr: [VipHosts, value]}
+      list_concat_unique:
+        - {get_attr: [HostsEntryValue, value]}
+        - {get_attr: [VipHosts, value, entries]}
   EnabledServices:
     description: The services enabled on each role
     value:
@@ -1187,6 +1202,7 @@ outputs:
           neutron_physical_bridge_name: {get_param: NeutronPhysicalBridge}
           neutron_public_interface_name: {get_param: NeutronPublicInterface}
           network_deployment_actions: {get_attr: [{{role.name}}NetworkDeploymentActionsValue, value]}
+        - {get_param: {{role.name}}ExtraGroupVars}
 {%- endfor %}
   RoleNetHostnameMap:
     description: Mapping of each network to a list of hostnames for each role

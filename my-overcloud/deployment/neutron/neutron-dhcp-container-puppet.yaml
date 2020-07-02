@@ -141,6 +141,12 @@ parameters:
                  no AZs will be configured for Neutron network services.
     default: ''
     type: string
+  NeutronDhcpAgentDnsmasqEnableAddr6List:
+    default: true
+    description: |
+      Enable dhcp-host entry with list of addresses when port has multiple
+      IPv6 addresses in the same subnet.
+    type: boolean
 
 conditions:
 
@@ -204,6 +210,7 @@ outputs:
             neutron::agents::dhcp::dnsmasq_dns_servers: {get_param: NeutronDhcpAgentDnsmasqDnsServers}
             neutron::agents::dhcp::interface_driver: {get_param: NeutronInterfaceDriver}
             neutron::agents::dhcp::dhcp_broadcast_reply: {get_param: NeutronDhcpServerBroadcastReply}
+            neutron::agents::dhcp::dnsmasq_enable_addr6_list: {get_param: NeutronDhcpAgentDnsmasqEnableAddr6List}
             neutron::agents::dhcp::debug:
               if:
               - service_debug_unset
@@ -306,12 +313,16 @@ outputs:
       container_config_scripts: {get_attr: [ContainersCommon, container_config_scripts]}
       deploy_steps_tasks:
         - when: step|int == 1
-          block:
+          block: &dhcp_wrapper_tasks
             - name: set conditions
               set_fact:
                 dnsmasq_wrapper_enabled: {get_param: NeutronEnableDnsmasqDockerWrapper}
                 haproxy_wrapper_enabled: {get_param: NeutronEnableHaproxyDockerWrapper}
-                debug_enabled: {get_param: Debug}
+                debug_enabled:
+                  if:
+                    - service_debug_unset
+                    - {get_param: Debug }
+                    - {get_param: NeutronWrapperDebug}
                 docker_additional_sockets: {get_param: DockerAdditionalSockets}
             - name: create kill_scripts directory within /var/lib/neutron
               file:
@@ -361,7 +372,7 @@ outputs:
             restart: always
             security_opt: 'label=disable'
             depends_on:
-              - openvswitch
+              - openvswitch.service
             healthcheck: {get_attr: [ContainersCommon, healthcheck_rpc_port]}
             ulimit: {get_param: DockerNeutronDHCPAgentUlimit}
             volumes:
@@ -370,7 +381,7 @@ outputs:
                 - {get_attr: [NeutronLogging, volumes]}
                 -
                   - /var/lib/kolla/config_files/neutron_dhcp.json:/var/lib/kolla/config_files/config.json:ro
-                  - /var/lib/config-data/puppet-generated/neutron/:/var/lib/kolla/config_files/src:ro
+                  - /var/lib/config-data/puppet-generated/neutron:/var/lib/kolla/config_files/src:ro
                   - /lib/modules:/lib/modules:ro
                   - /run/openvswitch:/run/openvswitch:shared,z
                   - /var/lib/neutron:/var/lib/neutron:shared,z
@@ -413,10 +424,10 @@ outputs:
           - - name: create /run/netns with temp namespace
               command: ip netns add ns_temp
               register: ipnetns_add_result
-              ignore_errors: True
+              failed_when: false
           - - name: remove temp namespace
               command: ip netns delete ns_temp
-              ignore_errors: True
+              failed_when: false
               when: ipnetns_add_result.rc == 0
           - - name: create /var/lib/neutron
               file:
@@ -428,15 +439,18 @@ outputs:
                 name: virt_sandbox_use_netlink
                 persistent: yes
                 state: yes
+      update_tasks:
+        - when: step|int == 1
+          block: *dhcp_wrapper_tasks
       upgrade_tasks: []
       fast_forward_upgrade_tasks:
         - when:
             - step|int == 0
-            - release == 'ocata'
+            - release == 'rocky'
           block:
             - name: Check if neutron_dhcp_agent is deployed
               command: systemctl is-enabled --quiet neutron-dhcp-agent
-              ignore_errors: True
+              failed_when: false
               register: neutron_dhcp_agent_enabled_result
             - name: Set fact neutron_dhcp_agent_enabled
               set_fact:
@@ -445,14 +459,14 @@ outputs:
           service: name=neutron-dhcp-agent state=stopped enabled=no
           when:
             - step|int == 2
-            - release == 'ocata'
+            - release == 'rocky'
             - neutron_dhcp_agent_enabled|bool
       post_upgrade_tasks:
         - name: Check for neutron user
           getent:
             database: passwd
             key: neutron
-          ignore_errors: True
+            fail_key: false
         - name: Set neutron_user_avail
           set_fact:
             neutron_user_avail: "{{ getent_passwd is defined }}"
@@ -468,7 +482,7 @@ outputs:
                 setfacl -R -m u:neutron:rw /var/lib/neutron
                 find /var/lib/neutron -type d -exec setfacl -m u:neutron:rwx '{}' \;
             - name: Provide access for domain sockets
-              ignore_errors: True
+              failed_when: false
               become: true
               shell: |
                 umask 0002
@@ -477,4 +491,4 @@ outputs:
                 - /var/lib/neutron/metadata_proxy
                 - /var/lib/neutron
               # These files are not necessarily present
-              ignore_errors: True
+              failed_when: false

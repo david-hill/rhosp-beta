@@ -30,9 +30,11 @@ parameter_defaults:
   NeutronMechanismDrivers: ['openvswitch']
   NeutronTypeDrivers: 'vxlan,vlan,flat,gre'
   NeutronNetworkType: 'vxlan'
+  NeutronPluginExtensions: "qos,port_security"
   NeutronServicePlugins: 'router,qos,segments,trunk'
   NeutronVniRanges: ['1:4094', ]
   NeutronEnableDVR: false
+  NeutronL3HA: true
   KernelIpNonLocalBind: 0
   Debug: true
   DockerPuppetDebug: True

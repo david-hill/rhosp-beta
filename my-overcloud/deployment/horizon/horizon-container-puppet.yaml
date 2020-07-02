@@ -98,6 +98,11 @@ parameters:
     default: ''
     description: Horizon has a global overrides mechanism available to perform customizations
     type: string
+  HorizonHelpURL:
+    default: 'http://docs.openstack.org'
+    description: On top of dashboard there is a Help button. This button could be used
+                 to re-direct user to vendor documentation or dedicated help portal.
+    type: string
   TimeZone:
     default: 'UTC'
     description: The timezone to be set on the overcloud.
@@ -185,7 +190,6 @@ outputs:
           horizon::customization_module: {get_param: HorizonCustomizationModule}
           horizon::timezone: {get_param: TimeZone}
           horizon::file_upload_temp_dir: '/var/tmp'
-          horizon::help_url: 'https://access.redhat.com/documentation/en-US/Red_Hat_Enterprise_Linux_OpenStack_Platform/16/index.html'
         -
           if:
           - websso_enabled
@@ -204,9 +208,8 @@ outputs:
           - debug_unset
           - horizon::django_debug: { get_param: HorizonDebug }
           - horizon::django_debug: { get_param: Debug }
-      service_config_settings:
-        keystone:
-          keystone_enable_member: true
+      ansible_group_vars:
+        keystone_enable_member: true
       # BEGIN DOCKER SETTINGS
       puppet_config:
         config_volume: horizon
@@ -266,71 +269,64 @@ outputs:
             net: host
             privileged: false
             restart: always
+            healthcheck:
+              test: /openstack/healthcheck
             volumes:
               list_concat:
                 - {get_attr: [ContainersCommon, volumes]}
                 -
                   - /var/lib/kolla/config_files/horizon.json:/var/lib/kolla/config_files/config.json:ro
-                  - /var/lib/config-data/puppet-generated/horizon/:/var/lib/kolla/config_files/src:ro
+                  - /var/lib/config-data/puppet-generated/horizon:/var/lib/kolla/config_files/src:ro
                   - /var/log/containers/horizon:/var/log/horizon:z
                   - /var/log/containers/httpd/horizon:/var/log/httpd:z
                   - /var/tmp/:/var/tmp/:z
                   - /var/www/:/var/www/:ro
-                  -
-                    if:
-                      - internal_tls_enabled
-                      - /etc/pki/tls/certs/httpd:/etc/pki/tls/certs/httpd:ro
-                      - ''
-                  -
-                    if:
-                      - internal_tls_enabled
-                      - /etc/pki/tls/private/httpd:/etc/pki/tls/private/httpd:ro
-                      - ''
+                - if:
+                    - internal_tls_enabled
+                    - - /etc/pki/tls/certs/httpd:/etc/pki/tls/certs/httpd:ro
+                    - []
+                - if:
+                    - internal_tls_enabled
+                    - - /etc/pki/tls/private/httpd:/etc/pki/tls/private/httpd:ro
+                    - []
             environment:
               KOLLA_CONFIG_STRATEGY: COPY_ALWAYS
               # Installed plugins:
-              ENABLE_CLOUDKITTY: no
-              ENABLE_IRONIC: yes
-              ENABLE_MAGNUM: no
-              ENABLE_MANILA: yes
-              ENABLE_HEAT: yes
+              ENABLE_CLOUDKITTY: 'no'
+              ENABLE_IRONIC: 'yes'
+              ENABLE_MAGNUM: 'no'
+              ENABLE_MANILA: 'yes'
+              ENABLE_HEAT: 'yes'
               # murano depends on heat-dashboard that is not yet installed
               # https://bugs.launchpad.net/tripleo/+bug/1752132
-              ENABLE_MURANO: no
-              ENABLE_MISTRAL: yes
-              ENABLE_OCTAVIA: yes
-              ENABLE_SAHARA: yes
-              ENABLE_TROVE: no
+              ENABLE_MURANO: 'no'
+              ENABLE_MISTRAL: 'yes'
+              ENABLE_OCTAVIA: 'yes'
+              ENABLE_SAHARA: 'yes'
+              ENABLE_TROVE: 'no'
               # Not installed:
-              ENABLE_FREEZER: no
-              ENABLE_FWAAS: no
-              ENABLE_KARBOR: no
-              ENABLE_DESIGNATE: no
-              ENABLE_SEARCHLIGHT: no
-              ENABLE_SENLIN: no
-              ENABLE_SOLUM: no
-              ENABLE_TACKER: no
-              ENABLE_WATCHER: no
-              ENABLE_ZAQAR: no
-              ENABLE_ZUN: no
+              ENABLE_FREEZER: 'no'
+              ENABLE_FWAAS: 'no'
+              ENABLE_KARBOR: 'no'
+              ENABLE_DESIGNATE: 'no'
+              ENABLE_SEARCHLIGHT: 'no'
+              ENABLE_SENLIN: 'no'
+              ENABLE_SOLUM: 'no'
+              ENABLE_TACKER: 'no'
+              ENABLE_WATCHER: 'no'
+              ENABLE_ZAQAR: 'no'
+              ENABLE_ZUN: 'no'
       host_prep_tasks:
         - name: create persistent directories
           file:
             path: "{{ item.path }}"
             state: directory
             setype: "{{ item.setype }}"
+            mode: "{{ item.mode|default(omit) }}"
           with_items:
-            - { 'path': /var/log/containers/horizon, 'setype': svirt_sandbox_file_t }
-            - { 'path': /var/log/containers/httpd/horizon, 'setype': svirt_sandbox_file_t }
+            - { 'path': /var/log/containers/horizon, 'setype': svirt_sandbox_file_t, 'mode': '0750' }
+            - { 'path': /var/log/containers/httpd/horizon, 'setype': svirt_sandbox_file_t, 'mode': '0750' }
             - { 'path': /var/www, 'setype': svirt_sandbox_file_t }
-            - { 'path': /var/log/horizon, 'setype': svirt_sandbox_file_t }
-        - name: horizon logs readme
-          copy:
-            dest: /var/log/horizon/readme.txt
-            content: |
-              Log files from horizon containers can be found under
-              /var/log/containers/horizon and /var/log/containers/httpd/horizon.
-          ignore_errors: true
       upgrade_tasks: []
       external_upgrade_tasks:
         - when:

@@ -72,6 +72,7 @@ resource_registry:
   OS::TripleO::Services::HeatApiCfn: OS::Heat::None
   OS::TripleO::Services::HeatApiCloudwatch: OS::Heat::None
   OS::TripleO::Services::HeatEngine: OS::Heat::None
+  OS::TripleO::Services::IpaClient: OS::Heat::None
   OS::TripleO::Services::IronicApi: OS::Heat::None
   OS::TripleO::Services::IronicConductor: OS::Heat::None
   OS::TripleO::Services::IronicInspector: OS::Heat::None
@@ -93,6 +94,7 @@ resource_registry:
   OS::TripleO::Services::MistralEventEngine: OS::Heat::None
   OS::TripleO::Services::MistralExecutor: OS::Heat::None
   OS::TripleO::Services::OpenStackClients: ../../deployment/clients/openstack-clients-baremetal-puppet.yaml
+  OS::TripleO::Services::PankoApi: OS::Heat::None
   OS::TripleO::Services::SaharaApi: OS::Heat::None
   OS::TripleO::Services::SaharaEngine: OS::Heat::None
   OS::TripleO::Services::Zaqar: OS::Heat::None

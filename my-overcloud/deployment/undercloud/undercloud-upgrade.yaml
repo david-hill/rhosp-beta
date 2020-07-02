@@ -30,6 +30,12 @@ parameters:
     description: Mapping of service endpoint -> protocol. Typically set
                  via parameter_defaults in the resource registry.
     type: json
+  SkipRhelEnforcement:
+    default: 'false'
+    description: Whether to avoid or not RHEL/OSP policies enforcement on Red Hat.
+                 Mainly for CI purpose.  It shouldn't matter on other distributions
+                 where it's disabled in the role. Set to true to skip the enforcement.
+    type: string
 
 outputs:
   role_data:
@@ -45,6 +51,15 @@ outputs:
         step_config: ''
         config_image: ''
       upgrade_tasks:
+        - name: Enforce RHOSP rules regarding subscription.
+          include_role:
+            name: tripleo-redhat-enforce
+          vars:
+            skip_rhel_enforcement: {get_param: SkipRhelEnforcement}
+          when:
+            - step|int == 0
+            - ansible_distribution == 'RedHat'
+            - not (skip_rhel_enforcement | bool)
         # With the layered product packaging, the key package is rhosp-openvswitch. It depends on
         # a openvswitch package that includes the version as part of the name (e.g openvswitch2.10).
         # This requires some additional special handling:
@@ -72,15 +87,24 @@ outputs:
         #     change with every major upgrade so this special handling will
         #     eventually replace the special handling of upgrading the
         #     openvswitch package "in place"
+        - name: Get current OpenvSwitch package name
+          register: ovs_pkg_out
+          shell:
+            rpm -qa | awk -F- '/^(openvswitch[0-9]+\.[0-9]+-[0-9]+\.[0-9]+\.[-0]+-|openvswitch-2)/{print $1}'
+        - name: Don't update if not present
+          set_fact:
+            run_ovs_update: "{{ (ovs_pkg_out.stdout | length) > 0 }}"
         - name: Block for gathering information for upgrading OpenvSwitch layered product packaging
-          when: step|int == 2
+          when:
+            - step|int == 2
+            - run_ovs_update|bool
           block:
             - name: Process rhosp-openvswitch layered package for new version number
               shell: |
                 set -o pipefail
                 yum info -q rhosp-openvswitch | awk '/^Version/{print $NF}'
               register: rhosp_package_result
-              ignore_errors: true
+              failed_when: false
             - name: Set fact for triggering OpenvSwitch layered product package handling
               set_fact:
                 ovs_lp_packaging: "{{ rhosp_package_result.rc == 0 }}"
@@ -88,11 +112,6 @@ outputs:
               set_fact:
                 new_ovs_version: "{{ rhosp_package_result.stdout }}"
               when: ovs_lp_packaging|default(false)
-
-            - name: Get current OpenvSwitch package name
-              register: ovs_pkg_out
-              shell:
-                rpm -qa | awk -F- '/^(openvswitch[0-9]+\.[0-9]+-|openvswitch-2)/{print $1}'
             - name: Get version from current OpenvSwitch package
               register: ovs_version_out
               shell:
@@ -135,17 +154,17 @@ outputs:
         - name: Check for openvswitch upgrade if not layered package installs
           when:
             - step|int == 2
-            - run_ovs_update|default(true)
+            - run_ovs_update|bool
           block:
             - name: check if an upgrade is required
               register: ovs_need_upgrade
-              ignore_errors: true
+              failed_when: false
               shell: |
                 yum check-upgrade openvswitch | awk '/openvswitch/{print}'
             - name: Check openvswitch packaging.
               shell: rpm -q --scripts openvswitch | awk '/postuninstall/,/*/' | grep -q "systemctl.*try-restart"
               register: ovs_packaging_issue
-              ignore_errors: true
+              failed_when: false
         - name: Upgrade openvswitch
           block:
             - name: "Ensure empty directory: emptying."
@@ -175,8 +194,8 @@ outputs:
                 - "{{ovs_list_of_rpms.stdout_lines}}"
           when:
             - step|int == 2
-            - run_ovs_update|default(true)
-            - ovs_packaging_issue|default(false)|succeeded
+            - run_ovs_update|bool
+            - ovs_packaging_issue.rc == 0 | default(false)
             - ovs_need_upgrade.stdout|default('')
         # The openvswitch package disables the systemd service on install. When installing
         # the layered product we prevent the service from being killed, but it doesn't

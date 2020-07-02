@@ -10,6 +10,14 @@ parameters:
   ContainerRedisConfigImage:
     description: The container image to use for the redis config_volume
     type: string
+  ClusterCommonTag:
+    default: false
+    description: When set to false, a pacemaker service is configured
+                 to use a floating tag for its container image name,
+                 e.g. 'REGISTRY/NAMESPACE/IMAGENAME:pcmklatest'. When
+                 set to true, the service uses a floating prefix as
+                 well, e.g. 'cluster.common.tag/IMAGENAME:pcmklatest'.
+    type: boolean
   EndpointMap:
     default: {}
     description: Mapping of service endpoint -> protocol. Typically set
@@ -65,6 +73,7 @@ conditions:
   internal_tls_enabled: {equals: [{get_param: EnableInternalTLS}, true]}
   redis_ipv6: {get_param: RedisIPv6}
   docker_enabled: {equals: [{get_param: ContainerCli}, 'docker']}
+  common_tag_enabled: {equals: [{get_param: ClusterCommonTag}, true]}
 
 resources:
 
@@ -93,12 +102,15 @@ outputs:
             redis::notify_service: false
             redis::managed_by_cluster_manager: true
             tripleo::profile::pacemaker::database::redis_bundle::redis_docker_image: &redis_image_pcmklatest
-              list_join:
-                - ':'
-                - - yaql:
-                      data: {get_param: ContainerRedisImage}
-                      expression: $.data.rightSplit(separator => ":", maxSplits => 1)[0]
-                  - 'pcmklatest'
+              yaql:
+                data:
+                  if:
+                    - common_tag_enabled
+                    - yaql:
+                        data: {get_param: ContainerRedisImage}
+                        expression: concat("cluster.common.tag/", $.data.rightSplit(separator => "/", maxSplits => 1)[1])
+                    - {get_param: ContainerRedisImage}
+                expression: concat($.data.rightSplit(separator => ":", maxSplits => 1)[0], ":pcmklatest")
             tripleo::profile::pacemaker::database::redis_bundle::control_port: 3124
             tripleo::profile::pacemaker::database::redis_bundle::container_backend: {get_param: ContainerCli}
             tripleo::redis::firewall_rules:
@@ -205,23 +217,8 @@ outputs:
       docker_config:
         step_2:
           map_merge:
-            - redis_restart_bundle:
-                start_order: 1
-                config_volume: redis
-                detach: false
-                net: host
-                ipc: host
-                user: root
-                environment:
-                  TRIPLEO_MINOR_UPDATE: ''
-                command: /pacemaker_restart_bundle.sh redis-bundle redis
-                image: {get_param: ContainerRedisConfigImage}
-                volumes:
-                  list_concat:
-                    - {get_attr: [ContainersCommon, pacemaker_restart_volumes]}
-                    - - /var/lib/config-data/puppet-generated/redis/:/var/lib/kolla/config_files/src:ro
             - redis_init_bundle:
-                start_order: 2
+                start_order: 1
                 detach: false
                 net: host
                 ipc: host
@@ -249,6 +246,21 @@ outputs:
                   # NOTE: this should force this container to re-run on each
                   # update (scale-out, etc.)
                   TRIPLEO_DEPLOY_IDENTIFIER: {get_param: DeployIdentifier}
+            - redis_restart_bundle:
+                start_order: 2
+                config_volume: redis
+                detach: false
+                net: host
+                ipc: host
+                user: root
+                environment:
+                  TRIPLEO_MINOR_UPDATE: ''
+                command: /pacemaker_restart_bundle.sh redis redis redis-bundle Slave Master
+                image: {get_param: ContainerRedisConfigImage}
+                volumes:
+                  list_concat:
+                    - {get_attr: [ContainersCommon, pacemaker_restart_volumes]}
+                    - - /var/lib/config-data/puppet-generated/redis:/var/lib/kolla/config_files/src:ro
             - if:
                 - internal_tls_enabled
                 - redis_tls_proxy:
@@ -262,7 +274,7 @@ outputs:
                         - {get_attr: [ContainersCommon, volumes]}
                         -
                           - /var/lib/kolla/config_files/redis_tls_proxy.json:/var/lib/kolla/config_files/config.json:ro
-                          - /var/lib/config-data/puppet-generated/redis/:/var/lib/kolla/config_files/src:ro
+                          - /var/lib/config-data/puppet-generated/redis:/var/lib/kolla/config_files/src:ro
                           - /etc/pki/tls/certs/redis.crt:/var/lib/kolla/config_files/src-tls/etc/pki/tls/certs/redis.crt:ro
                           - /etc/pki/tls/private/redis.key:/var/lib/kolla/config_files/src-tls/etc/pki/tls/private/redis.key:ro
                     environment:
@@ -276,23 +288,16 @@ outputs:
             path: "{{ item.path }}"
             state: directory
             setype: "{{ item.setype }}"
+            mode: "{{ item.mode|default(omit) }}"
           with_items:
             - { 'path': /var/lib/redis, 'setype': svirt_sandbox_file_t }
-            - { 'path': /var/log/containers/redis, 'setype': svirt_sandbox_file_t }
+            - { 'path': /var/log/containers/redis, 'setype': svirt_sandbox_file_t, 'mode': '0750' }
             - { 'path': /var/run/redis, 'setype': svirt_sandbox_file_t }
-            - { 'path': /var/log/redis, 'setype': svirt_sandbox_file_t }
         - name: ensure /var/run/redis is present upon reboot
           copy:
             dest: /etc/tmpfiles.d/var-run-redis.conf
             content: |
               d /var/run/redis 0755 root root - -
-        - name: redis logs readme
-          copy:
-            dest: /var/log/redis/readme.txt
-            content: |
-              Log files from redis containers can be found under
-              /var/log/containers/redis.
-          ignore_errors: true
       deploy_steps_tasks:
         - name: Redis tag container image for pacemaker
           when: step|int == 1
@@ -325,19 +330,6 @@ outputs:
                 container_image: "{{redis_image}}"
                 container_image_latest: "{{redis_image_latest}}"
               when:
-                - old_redis_image_id.stdout != new_redis_image_id.stdout
-            - block:
-                - name: Get a list of containers using redis image
-                  shell: "{{container_cli}} ps -a -q -f 'ancestor={{old_redis_image_id.stdout}}'"
-                  register: redis_containers_to_destroy
-                # It will be recreated with the delpoy step.
-                - name: Remove any containers using the same redis image
-                  shell: "{{container_cli}} rm -fv {{item}}"
-                  with_items: "{{ redis_containers_to_destroy.stdout_lines }}"
-                - name: Remove previous redis images
-                  shell: "{{container_cli}} rmi -f {{old_redis_image_id.stdout}}"
-              when:
-                - old_redis_image_id.stdout != ''
                 - old_redis_image_id.stdout != new_redis_image_id.stdout
 
       upgrade_tasks:
@@ -396,7 +388,7 @@ outputs:
               block:
                 - name: Check redis logging configuration in pacemaker
                   command: cibadmin --query --xpath "//storage-mapping[@id='redis-log' and @source-dir='/var/log/containers/redis']"
-                  ignore_errors: true
+                  failed_when: false
                   register: redis_logs_moved
                 - name: Change redis logging configuration in pacemaker
                   # rc == 6 means the configuration doesn't exist in the CIB
@@ -408,8 +400,10 @@ outputs:
                       command: pcs resource bundle update redis-bundle storage-map add id=redis-log source-dir=/var/log/containers/redis target-dir=/var/log/redis options=rw
             - name: Update the redis bundle to use the new container image name
               command: "pcs resource bundle update redis-bundle container image={{redis_image_latest}}"
-        - when:
+        - name: Create hiera data to upgrade redis in a stepwise manner.
+          when:
             - step|int == 1
+            - cluster_recreate|bool
           block:
             - name: set redis upgrade node facts in a single-node environment
               set_fact:
@@ -422,11 +416,8 @@ outputs:
                 cacheable: no
               when:
                 - groups['redis'] | length > 1
-                - item.split('.')[0] in ansible_limit.split(',')
+                - item.split('.')[0] in ansible_limit.split(':')
               loop: "{{ redis_short_node_names }}"
-
-            - debug:
-                msg: "Prepare redis upgrade for {{ redis_short_node_names_upgraded }}"
             - fail:
                 msg: >
                   You can't upgrade redis without staged
@@ -435,13 +426,16 @@ outputs:
               when: >-
                 redis_short_node_names_upgraded is not defined or
                 redis_short_node_names_upgraded | length == 0
-
+            - debug:
+                msg: "Prepare redis upgrade for {{ redis_short_node_names_upgraded }}"
             - name: remove redis init container on upgrade-scaleup to force re-init
-              shell: |
-                if podman inspect redis_init_bundle &> /dev/null; then
-                    podman rm redis_init_bundle
-                fi
-              when: redis_short_node_names_upgraded | length > 1
+              include_role:
+                name: tripleo-container-rm
+              vars:
+                tripleo_containers_to_rm:
+                  - redis_init_bundle
+              when:
+                - redis_short_node_names_upgraded | length > 1
             - name: add the redis short name to hiera data for the upgrade.
               include_role:
                 name: tripleo-upgrade-hiera
@@ -464,7 +458,7 @@ outputs:
       fast_forward_upgrade_tasks:
         - when:
             - step|int == 0
-            - release == 'ocata'
+            - release == 'rocky'
             - is_bootstrap_node|bool
           block:
             - name: Check cluster resource status of redis
@@ -472,7 +466,7 @@ outputs:
                 resource: {get_attr: [RedisBase, role_data, service_name]}
                 state: show
                 check_mode: false
-              ignore_errors: true
+              failed_when: false
               register: redis_res_result
             - name: Set fact redis_res
               set_fact:
@@ -487,6 +481,6 @@ outputs:
           until: redis_output.rc == 0
           when:
             - step|int == 2
-            - release == 'ocata'
+            - release == 'rocky'
             - is_bootstrap_node|bool
             - redis_res|bool

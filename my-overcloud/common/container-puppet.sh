@@ -22,6 +22,10 @@ if [ -n "$PUPPET_TAGS" ]; then
     TAGS="--tags \"$PUPPET_TAGS\""
 fi
 
+if [ ! -z ${STEP_CONFIG+x} ]; then
+    echo -e "${STEP_CONFIG}" | tee /etc/config.pp
+fi
+
 CHECK_MODE=""
 if [ -d "/tmp/puppet-check-mode" ]; then
     mkdir -p /etc/puppet/check-mode
@@ -68,7 +72,7 @@ verbosity=""
 
 # Disables archiving
 if [ -z "$NO_ARCHIVE" ]; then
-    archivedirs=("/etc" "/root" "/opt" "/var/lib/ironic/tftpboot" "/var/lib/ironic/httpboot" "/var/www" "/var/spool/cron" "/var/lib/nova/.ssh")
+    archivedirs=("/etc" "/root" "/opt" "/var/www" "/var/spool/cron" "/var/lib/nova/.ssh")
     rsync_srcs=""
     for d in "${archivedirs[@]}"; do
         if [ -d "$d" ]; then
@@ -94,7 +98,10 @@ if [ -z "$NO_ARCHIVE" ]; then
 
     # Exclude read-only mounted directories/files which we do not want
     # to copy or delete.
-    ro_files="/etc/puppetlabs/ /opt/puppetlabs/"
+    ro_files="/etc/puppet/ /etc/puppetlabs/ /opt/puppetlabs/ /etc/pki/ca-trust/extracted "
+    ro_files+="/etc/pki/ca-trust/source/anchors /etc/pki/tls/certs/ca-bundle.crt "
+    ro_files+="/etc/pki/tls/certs/ca-bundle.trust.crt /etc/pki/tls/cert.pem "
+    ro_files+="/etc/hosts /etc/localtime"
     for ro in $ro_files; do
         if [ -e "$ro" ]; then
             exclude_files+=" --exclude=$ro"
@@ -121,7 +128,7 @@ if [ -z "$NO_ARCHIVE" ]; then
     echo "Ensuring the removed config files are also purged in ${puppet_generated_path}:"
     cat $TMPFILE | sort
     cat $TMPFILE | xargs -n1 -r -I{} \
-        bash -c "rm -f ${puppet_generated_path}/{}"
+        bash -c "rm -rf ${puppet_generated_path}/{}"
     exec 5>&1
     exec 1>$TMPFILE2
     find $rsync_srcs -newer $origin_of_time -not -path '/etc/puppet*' -print0

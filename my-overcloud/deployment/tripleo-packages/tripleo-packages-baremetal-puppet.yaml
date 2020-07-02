@@ -40,7 +40,7 @@ parameters:
     constraints:
       - allowed_values: ['tripleo-repos', 'custom-script']
   FastForwardRepoArgs:
-    default: {'tripleo_repos': {'ocata': '-b ocata current', 'pike': '-b pike current', 'queens': '-b queens current'}}
+    default: {'tripleo_repos': {'rocky': '-b rocky current', 'stein': '-b stein current', 'train': '-b train current'}}
     type: json
   FastForwardCustomRepoScriptContent:
     default: |
@@ -48,13 +48,13 @@ parameters:
       set -e
       echo "If you use FastForwardRepoType 'custom-script' you have to provide the upgrade repo script content."
       echo "It will be installed as /root/ffu_upgrade_repo.sh on the node"
-      echo "and passed the upstream name (ocata, pike, queens) of the release as first argument"
+      echo "and passed the upstream name (rocky, stein, train) of the release as first argument"
       exit 1
     type: string
   UpgradeLeappEnabled:
     description: Use Leapp for operating system upgrade
     type: boolean
-    default: true
+    default: false
   UpgradeLeappDebug:
     description: Print debugging output when running Leapp
     type: boolean
@@ -65,10 +65,25 @@ parameters:
       development/testing. For example, LEAPP_DEVEL_SKIP_RHSM=1.
     type: string
     default: ''
+  UpgradeLeappCommandOptions:
+    description: |
+      In case or using UpgradeLeappDevelSkip with LEAPP_NO_RHSM=1 user
+      can specify --enablerepo <repo1> --enablerepo <repo2> options for
+      leapp to use these repositories for the upgrade process.
+    type: string
+    default: ''
   UpgradeLeappRebootTimeout:
     description: Timeout (seconds) for the OS upgrade phase via Leapp
     type: number
-    default: 1800
+    default: 3600
+  UpgradeLeappToRemove:
+    default: []
+    description: List of packages to remove during Leapp upgrade.
+    type: comma_delimited_list
+  UpgradeLeappToInstall:
+    default: []
+    description: List of packages to install after Leapp upgrade.
+    type: comma_delimited_list
   UpgradeInitCommand:
     type: string
     description: |
@@ -83,6 +98,16 @@ parameters:
       major-upgrade-composable-steps.yaml and major-upgrade-converge.yaml
       environment files.
     default: ''
+  SkipPackageUpdate:
+    default: 'false'
+    description: Set to true to skip the update all packages
+    type: boolean
+  SkipRhelEnforcement:
+    default: "false"
+    description: Whether to avoid or not RHEL/OSP policies enforcement on Red Hat.
+                 Mainly for CI purpose.  It shouldn't matter on other distributions
+                 where it's disabled in the role. Set to true to skip the enforcement.
+    type: string
 
 outputs:
   role_data:
@@ -94,37 +119,95 @@ outputs:
       step_config: |
         include ::tripleo::packages
       upgrade_tasks:
-        - name: set leapp facts
-          tags: always
+        - name: Gather missing facts
+          setup:
+            gather_subset: "distribution"
+          when: >-
+            ansible_facts['distribution'] is not defined or
+            ansible_facts['distribution_major_version'] is not defined
+          tags:
+           - always
+
+        - name: Set leapp facts
           set_fact:
-            upgrade_leapp_enabled: {get_param: UpgradeLeappEnabled}
+            upgrade_leapp_enabled: >-
+              {{ _upgradeLeappEnabled | bool and
+                 ansible_facts['distribution'] == 'RedHat' and
+                 ansible_facts['distribution_major_version'] is version('7', '==') }}
             upgrade_leapp_debug: {get_param: UpgradeLeappDebug}
             upgrade_leapp_devel_skip: {get_param: UpgradeLeappDevelSkip}
+            upgrade_leapp_command_options: {get_param: UpgradeLeappCommandOptions}
             upgrade_leapp_reboot_timeout: {get_param: UpgradeLeappRebootTimeout}
+          vars:
+            _upgradeLeappEnabled: {get_param: UpgradeLeappEnabled}
+          tags:
+            - always
 
         - name: system_upgrade_prepare step 3
           tags:
             - never
             - system_upgrade
             - system_upgrade_prepare
-          when: step|int == 3
+          when:
+            - step|int == 3
+            - upgrade_leapp_enabled
           block:
-            - name: remove all OpenStack packages
+            - name: Hack around broken ceph-common rpm removing /etc/ceph /var/lib/ceph
+              ignore_errors: true
               shell: |
-                yum -y remove *el7ost* -- \
-                  -*openvswitch* \
-                  -python2-babel \
-                  -python2-dateutil \
-                  -python2-ipaddress \
-                  -python2-jinja2 \
-                  -python2-markupsafe \
-                  -python2-six
-              when: upgrade_leapp_enabled
+                rpm -e --nodeps --noscripts ceph-common
+            - name: remove all OpenStack packages
+              shell: >-
+                yum -y remove
+                *el7ost*
+                galera*
+                haproxy*
+                httpd
+                kernel-devel
+                mysql*
+                pacemaker*
+                python-jsonpointer
+                qemu-kvm-common-rhev
+                qemu-img-rhev
+                rabbit*
+                redis*
+                --
+                -*openvswitch*
+                -python-docker
+                -python-PyMySQL
+                -python-pysocks
+                -python2-asn1crypto
+                -python2-babel
+                -python2-cffi
+                -python2-cryptography
+                -python2-dateutil
+                -python2-idna
+                -python2-ipaddress
+                -python2-jinja2
+                -python2-jsonpatch
+                -python2-markupsafe
+                -python2-pyOpenSSL
+                -python2-requests
+                -python2-six
+                -python2-urllib3
             - name: install leapp
               package:
                 name: leapp
                 state: latest
-              when: upgrade_leapp_enabled
+            - name: "add packages into Leapp's to_remove file"
+              vars:
+                pkg_to_remove: { get_param: UpgradeLeappToRemove }
+              lineinfile:
+                path: "/etc/leapp/transaction/to_remove"
+                line: "{{ item }}"
+              loop: "{{ pkg_to_remove }}"
+            - name: "add packages into Leapp's to_install file"
+              vars:
+                pkg_to_install: { get_param: UpgradeLeappToInstall }
+              lineinfile:
+                path: "/etc/leapp/transaction/to_install"
+                line: "{{ item }}"
+              loop: "{{ pkg_to_install }}"
 
         - name: system_upgrade_prepare step 4
           tags:
@@ -133,11 +216,16 @@ outputs:
             - system_upgrade_prepare
           when: step|int == 4
           block:
+            - name: set leapp options
+              shell: >
+                leapp answer --section remove_pam_pkcs11_module_check.confirm=True --add
+              when: upgrade_leapp_enabled
             - name: run leapp upgrade (download packages)
               shell: >
                 {% if upgrade_leapp_devel_skip|default(false) %}{{ upgrade_leapp_devel_skip }}{% endif %}
                 leapp upgrade
                 {% if upgrade_leapp_debug|default(true) %}--debug{% endif %}
+                {% if upgrade_leapp_command_options|default(false) %}{{ upgrade_leapp_command_options }}{% endif %}
               when: upgrade_leapp_enabled
 
         - name: system_upgrade_run step 4
@@ -149,12 +237,19 @@ outputs:
             # but doesn't want to reboot, they can run with
             # `--skip-tags system_upgrade_reboot`.
             - system_upgrade_reboot
-          when: step|int == 4
+          when:
+            - step|int == 4
+            - upgrade_leapp_enabled
           block:
             - name: reboot to perform the upgrade
               reboot:
                 reboot_timeout: "{{upgrade_leapp_reboot_timeout}}"
-              when: upgrade_leapp_enabled
+            - name: Clear gathered facts from all currently targeted hosts
+              meta: clear_facts
+            - name: Force facts refresh after OS upgrade to refresh cache.
+              setup:
+            - name: Set the python to python3
+              shell: alternatives --set python /usr/bin/python3
 
         - name: Package and repo update tasks
           when: step|int == 0
@@ -172,6 +267,9 @@ outputs:
                   - ''
                   - - "#!/bin/bash\n\n"
                     - {get_param: UpgradeInitCommonCommand}
+            - name: Ensure EL modules are in proper state
+              shell: dnf -y distro-sync
+              when: ansible_distribution_major_version == '8'
             - name: Ensure TripleO prerequisite packages are installed
               package:
                 name:
@@ -184,6 +282,7 @@ outputs:
                   - pcs
                   - puppet-tripleo
                   - python3-heat-agent*
+                  - rsync
                 state: present
               when: ansible_distribution_major_version == '8'
         # With the layered product packaging, the key package is rhosp-openvswitch. It depends on
@@ -213,15 +312,24 @@ outputs:
         #     change with every major upgrade so this special handling will
         #     eventually replace the special handling of upgrading the
         #     openvswitch package "in place"
+        - name: Get current OpenvSwitch package name
+          register: ovs_pkg_out
+          shell:
+            rpm -qa | awk -F- '/^(openvswitch[0-9]+\.[0-9]+-[0-9]+\.[0-9]+\.[-0]+-|openvswitch-2)/{print $1}'
+        - name: Don't update if not present
+          set_fact:
+            run_ovs_update: "{{ (ovs_pkg_out.stdout | length) > 0 }}"
         - name: Block for gathering information for upgrading OpenvSwitch layered product packaging
-          when: step|int == 2
+          when:
+            - step|int == 2
+            - run_ovs_update|bool
           block:
             - name: Process rhosp-openvswitch layered package for new version number
               shell: |
                 set -o pipefail
                 yum info -q rhosp-openvswitch | awk '/^Version/{print $NF}'
               register: rhosp_package_result
-              ignore_errors: true
+              failed_when: false
             - name: Set fact for triggering OpenvSwitch layered product package handling
               set_fact:
                 ovs_lp_packaging: "{{ rhosp_package_result.rc == 0 }}"
@@ -229,11 +337,6 @@ outputs:
               set_fact:
                 new_ovs_version: "{{ rhosp_package_result.stdout }}"
               when: ovs_lp_packaging|default(false)
-
-            - name: Get current OpenvSwitch package name
-              register: ovs_pkg_out
-              shell:
-                rpm -qa | awk -F- '/^(openvswitch[0-9]+\.[0-9]+-|openvswitch-2)/{print $1}'
             - name: Get version from current OpenvSwitch package
               register: ovs_version_out
               shell:
@@ -276,17 +379,17 @@ outputs:
         - name: Check for openvswitch upgrade if not layered package installs
           when:
             - step|int == 2
-            - run_ovs_update|default(true)
+            - run_ovs_update|bool
           block:
             - name: check if an upgrade is required
               register: ovs_need_upgrade
-              ignore_errors: true
+              failed_when: false
               shell: |
                 yum check-upgrade openvswitch | awk '/openvswitch/{print}'
             - name: Check openvswitch packaging.
               shell: rpm -q --scripts openvswitch | awk '/postuninstall/,/*/' | grep -q "systemctl.*try-restart"
               register: ovs_packaging_issue
-              ignore_errors: true
+              failed_when: false
         - name: Upgrade openvswitch
           block:
             - name: "Ensure empty directory: emptying."
@@ -316,8 +419,8 @@ outputs:
                 - "{{ovs_list_of_rpms.stdout_lines}}"
           when:
             - step|int == 2
-            - run_ovs_update|default(true)
-            - ovs_packaging_issue|default(false)|succeeded
+            - run_ovs_update|bool
+            - ovs_packaging_issue.rc == 0 | default(false)
             - ovs_need_upgrade.stdout|default('')
         - name: Install libibverbs (https://bugs.launchpad.net/tripleo/+bug/1817743)
           when: step|int == 2
@@ -341,7 +444,7 @@ outputs:
         - name: Check that os-net-config has configuration
           shell: test -s /etc/os-net-config/config.json
           register: os_net_config_has_config
-          ignore_errors: True
+          failed_when: false
           when: step|int == 3
         - block:
             - name: Upgrade os-net-config
@@ -355,10 +458,15 @@ outputs:
             - step|int == 3
             - os_net_config_need_upgrade.stdout
             - os_net_config_has_config.rc == 0
+        - name: Set boolean skip_package_update
+          set_fact:
+            skip_package_update: {get_param: SkipPackageUpdate}
         # Exclude ansible until https://github.com/ansible/ansible/issues/56636
         # is available
         - name: Update all packages
-          when: step|int == 3
+          when:
+            - step|int == 3
+            - not skip_package_update|bool
           yum:
             name: '*'
             state: latest
@@ -379,6 +487,15 @@ outputs:
                 name: tripleo-transfer
                 tasks_from: cleanup.yml
       update_tasks:
+        - name: Enforce RHOSP rules regarding subscription.
+          include_role:
+            name: tripleo-redhat-enforce
+          vars:
+            skip_rhel_enforcement: {get_param: SkipRhelEnforcement}
+          when:
+            - step|int == 0
+            - ansible_distribution == 'RedHat'
+            - not (skip_rhel_enforcement | bool)
         - name: Check for existing yum.pid
           stat:  path=/var/run/yum.pid
           register: yum_pid_file
@@ -386,10 +503,15 @@ outputs:
         - name: Exit if existing yum process
           fail: msg="ERROR existing yum.pid detected - can't continue! Please ensure there is no other package update process for the duration of the minor update worfklow. Exiting."
           when: (step|int == 0 or step|int == 3) and yum_pid_file.stat.exists
+        - name: Set boolean skip_package_update
+          set_fact:
+            skip_package_update: {get_param: SkipPackageUpdate}
         # Exclude ansible until https://github.com/ansible/ansible/issues/56636
         # is available
         - name: Update all packages
-          when: step|int == 3
+          when:
+            - step|int == 3
+            - not skip_package_update|bool
           yum:
             name: '*'
             state: latest

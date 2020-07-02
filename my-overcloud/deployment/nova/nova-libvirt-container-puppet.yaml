@@ -65,6 +65,8 @@ parameters:
     description: The Ceph client key. Can be created with ceph-authtool --gen-print-key.
     type: string
     hidden: true
+    constraints:
+    - allowed_pattern: "^[a-zA-Z0-9+/]{38}==$"
   CephClusterFSID:
     type: string
     description: The Ceph cluster FSID. Must be a UUID.
@@ -223,6 +225,12 @@ parameters:
       Override the compile time default TLS priority string.
     type: string
     default: 'NORMAL:-VERS-SSL3.0:-VERS-TLS-ALL:+VERS-TLS1.2'
+  ContainerCpusetCpus:
+    description: Limit the specific CPUs or cores a container can use.
+    type: string
+    default: 'all'
+    tags:
+      - role_specific
 
 conditions:
 
@@ -321,10 +329,12 @@ resources:
           - map_replace:
             - vhostuser_socket_group: VhostuserSocketGroup
               nova::compute::libvirt::qemu::memory_backing_dir: QemuMemoryBackingDir
+              container_cpuset_cpus: ContainerCpusetCpus
             - values: {get_param: [RoleParameters]}
           - values:
               VhostuserSocketGroup: {get_param: VhostuserSocketGroup}
               QemuMemoryBackingDir: {get_param: QemuMemoryBackingDir}
+              ContainerCpusetCpus: {get_param: ContainerCpusetCpus}
 
 
   ContainersCommon:
@@ -554,16 +564,11 @@ outputs:
           list_join:
             - "\n"
             - - include tripleo::profile::base::nova::libvirt
-              - include tripleo::profile::base::nova::compute::libvirt_guests
               - {get_attr: [MySQLClient, role_data, step_config]}
         config_image: {get_param: ContainerNovaLibvirtConfigImage}
       kolla_config:
         /var/lib/kolla/config_files/nova_libvirt.json:
-          command:
-            if:
-              - use_tls_for_live_migration
-              - /usr/sbin/libvirtd --listen
-              - /usr/sbin/libvirtd
+          command: /nova_libvirt_launcher.sh
           config_files:
             list_concat:
               -
@@ -634,6 +639,24 @@ outputs:
               dest: "/"
               merge: true
               preserve_properties: true
+      container_config_scripts:
+        nova_libvirt_launcher.sh:
+          mode: "0755"
+          content:
+            str_replace:
+              template: |
+                #!/bin/bash
+                set -xe
+                if [[ -f /usr/lib/systemd/kvm-setup ]]; then
+                  /usr/lib/systemd/kvm-setup
+                fi
+                /usr/sbin/libvirtd LIBVIRTD_ARGS
+              params:
+                LIBVIRTD_ARGS:
+                  if:
+                    - use_tls_for_live_migration
+                    - '--listen'
+                    - ''
       docker_config:
         step_3:
           nova_virtlogd:
@@ -645,12 +668,14 @@ outputs:
             security_opt: label=disable
             privileged: true
             restart: always
+            healthcheck:
+              test: '/openstack/healthcheck virtlogd'
             volumes:
               list_concat:
                 - {get_attr: [ContainersCommon, volumes]}
                 -
                   - /var/lib/kolla/config_files/nova_virtlogd.json:/var/lib/kolla/config_files/config.json:ro
-                  - /var/lib/config-data/puppet-generated/nova_libvirt/:/var/lib/kolla/config_files/src:ro
+                  - /var/lib/config-data/puppet-generated/nova_libvirt:/var/lib/kolla/config_files/src:ro
                   - /lib/modules:/lib/modules:ro
                   - /dev:/dev
                   - /run:/run
@@ -659,13 +684,7 @@ outputs:
                   - /var/lib/libvirt:/var/lib/libvirt
                   - /etc/libvirt/qemu:/etc/libvirt/qemu:ro
                   - /var/log/libvirt/qemu:/var/log/libvirt/qemu
-                # podman fails to relable if nova_nfs_enabled where we have
-                # the nfs share mounted to /var/lib/nova/instances
-                -
-                  if:
-                  - nova_nfs_enabled
-                  - - /var/lib/nova:/var/lib/nova:shared
-                  - - /var/lib/nova:/var/lib/nova:shared,z
+                  - /var/lib/nova:/var/lib/nova:shared
             environment:
               KOLLA_CONFIG_STRATEGY: COPY_ALWAYS
           nova_libvirt:
@@ -677,18 +696,20 @@ outputs:
             privileged: true
             security_opt: label=disable
             restart: always
-            cpuset_cpus: all
+            cpuset_cpus: {get_attr: [RoleParametersValue, value, container_cpuset_cpus]}
             depends_on:
-              - tripleo_nova_virtlogd
+              - tripleo_nova_virtlogd.service
             healthcheck:
-              test: /openstack/healthcheck
+              test: '/openstack/healthcheck libvirtd'
             volumes:
               list_concat:
                 - {get_attr: [ContainersCommon, volumes]}
                 - {get_attr: [NovaLibvirtLogging, volumes]}
                 -
+                  - /etc/ssh/ssh_known_hosts:/etc/ssh/ssh_known_hosts:ro
                   - /var/lib/kolla/config_files/nova_libvirt.json:/var/lib/kolla/config_files/config.json:ro
-                  - /var/lib/config-data/puppet-generated/nova_libvirt/:/var/lib/kolla/config_files/src:ro
+                  - /var/lib/config-data/puppet-generated/nova_libvirt:/var/lib/kolla/config_files/src:ro
+                  - /var/lib/container-config-scripts/nova_libvirt_launcher.sh:/nova_libvirt_launcher.sh:ro
                   - /etc/ceph:/var/lib/kolla/config_files/src-ceph:ro
                   - /lib/modules:/lib/modules:ro
                   - /dev:/dev
@@ -699,13 +720,7 @@ outputs:
                   - /var/lib/libvirt:/var/lib/libvirt:shared,z
                   - /var/log/libvirt/qemu:/var/log/libvirt/qemu:ro
                   - /var/lib/vhost_sockets:/var/lib/vhost_sockets:z
-                # podman fails to relable if nova_nfs_enabled where we have
-                # the nfs share mounted to /var/lib/nova/instances
-                -
-                  if:
-                  - nova_nfs_enabled
-                  - - /var/lib/nova:/var/lib/nova:shared
-                  - - /var/lib/nova:/var/lib/nova:shared,z
+                  - /var/lib/nova:/var/lib/nova:shared
                 -
                   if:
                     - docker_enabled
@@ -812,7 +827,7 @@ outputs:
               delay: 30
               until: nova_libvirt_healthcheck_state.status.ExecMainPID != '0' and
                 nova_libvirt_healthcheck_state.status.ActiveState in ['inactive', 'failed']
-              ignore_errors: yes
+              failed_when: false
             - name: Fail if nova-libvirt healthcheck report failed status
               fail:
                 msg: nova-libvirt isn't working (healtcheck failed)

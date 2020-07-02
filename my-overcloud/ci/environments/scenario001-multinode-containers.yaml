@@ -5,6 +5,11 @@ resource_registry:
   OS::TripleO::Services::CephMon: ../../deployment/ceph-ansible/ceph-mon.yaml
   OS::TripleO::Services::CephOSD: ../../deployment/ceph-ansible/ceph-osd.yaml
   OS::TripleO::Services::CephClient: ../../deployment/ceph-ansible/ceph-client.yaml
+  OS::TripleO::Services::PankoApi: ../deployment/deprecated/panko/panko-api-container-puppet.yaml
+  OS::TripleO::Services::CeilometerAgentCentral: ../../deployment/ceilometer/ceilometer-agent-central-container-puppet.yaml
+  OS::TripleO::Services::CeilometerAgentNotification: ../../deployment/ceilometer/ceilometer-agent-notification-container-puppet.yaml
+  OS::TripleO::Services::CeilometerAgentIpmi: ../../deployment/ceilometer/ceilometer-agent-ipmi-container-puppet.yaml
+  OS::TripleO::Services::ComputeCeilometerAgent: ../../deployment/ceilometer/ceilometer-agent-compute-container-puppet.yaml
   OS::TripleO::Services::Collectd: ../../deployment/metrics/collectd-container-puppet.yaml
   OS::TripleO::Services::MetricsQdr: ../../deployment/metrics/qdr-container-puppet.yaml
   OS::TripleO::Services::OsloMessagingRpc: ../../deployment/rabbitmq/rabbitmq-messaging-rpc-pacemaker-puppet.yaml
@@ -75,6 +80,7 @@ parameter_defaults:
     - OS::TripleO::Services::GnocchiApi
     - OS::TripleO::Services::GnocchiMetricd
     - OS::TripleO::Services::GnocchiStatsd
+    - OS::TripleO::Services::PankoApi
     - OS::TripleO::Services::CephMgr
     - OS::TripleO::Services::CephMon
     - OS::TripleO::Services::CephOSD
@@ -101,6 +107,8 @@ parameter_defaults:
     # telemetry.alarm_granularity must in sync with the archive policy, 60s
     # too.
     ceilometer::agent::polling::polling_interval: 15
+    # NOTE(mmagr): uncomment when QDR mesh will actually work (followup on review.opendev.org/702754)
+    #tripleo::profile::base::metrics::qdr::router_mode: interior
   ManagePolling: true
   ManagePipeline: true
   CeilometerEnableGnocchi: true
@@ -108,6 +116,9 @@ parameter_defaults:
     - gnocchi://?archive_policy=ceilometer-high-rate
   EventPipelinePublishers:
     - gnocchi://?archive_policy=ceilometer-high-rate
+    - panko://
+  CeilometerQdrPublishEvents: true
+  ManageEventPipeline: true
 
   Debug: true
   DockerPuppetDebug: True
@@ -117,6 +128,7 @@ parameter_defaults:
     journal_size: 512
     osd_scenario: collocated
   CephPoolDefaultPgNum: 32
+  CephAnsibleRepo: "tripleo-centos-ceph-nautilus"
   CephPoolDefaultSize: 1
   CephPools:
     - name: altrbd
@@ -133,8 +145,6 @@ parameter_defaults:
   # a production deployment. What is here is suitable for
   # developer and CI testing only.
   CephClusterFSID: '4b5c8c0a-ff60-454b-a1b4-9747aa737d19'
-  CephMonKey: 'AQC+Ox1VmEr3BxAALZejqeHj50Nj6wJDvs96OQ=='
-  CephAdminKey: 'AQDLOh1VgEp6FRAAFzT7Zw+Y9V6JJExQAsRnRQ=='
   CephClientKey: 'AQC+vYNXgDAgAhAAc8UoYt+OTz5uhV7ItLdwUw=='
   CephAnsiblePlaybookVerbosity: 1
   CephAnsibleEnvironmentVariables:

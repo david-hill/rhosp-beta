@@ -4,6 +4,10 @@ description: >
   OpenStack containerized Neutron API service
 
 parameters:
+  ContainerNeutronApiImageStein:
+    description: image
+    type: string
+    default: ''
   ContainerNeutronApiImage:
     description: image
     type: string
@@ -41,6 +45,12 @@ parameters:
     default: {}
     description: Parameters specific to the role
     type: json
+  DeployIdentifier:
+    default: ''
+    type: string
+    description: >
+      Setting this to a unique value will re-run any deployment tasks which
+      perform configuration on a Heat stack-update.
   EnableInternalTLS:
     type: boolean
     default: false
@@ -88,6 +98,10 @@ parameters:
     description: Enable Neutron DVR.
     default: ''
     type: string
+  NeutronEnableIgmpSnooping:
+    description: Enable IGMP Snooping.
+    type: boolean
+    default: false
   KeystoneRegion:
     type: string
     default: 'regionOne'
@@ -168,6 +182,7 @@ parameter_groups:
   - NeutronL3HA
 
 conditions:
+  fast_forward_upgrade: {not: {equals: [{get_param: ContainerNeutronApiImageStein},'']}}
   use_tls_proxy: {equals : [{get_param: EnableInternalTLS}, true]}
   neutron_workers_unset: {equals : [{get_param: NeutronWorkers}, '']}
   neutron_rpc_workers_unset: {equals : [{get_param: NeutronRpcWorkers}, '']}
@@ -218,6 +233,17 @@ outputs:
     description: Role data for the Neutron API role.
     value:
       service_name: neutron_api
+      keystone_resources:
+        neutron:
+          endpoints:
+            public: {get_param: [EndpointMap, NeutronPublic, uri]}
+            internal: {get_param: [EndpointMap, NeutronInternal, uri]}
+            admin: {get_param: [EndpointMap, NeutronAdmin, uri]}
+          users:
+            neutron:
+              password: {get_param: NeutronPassword}
+          region: {get_param: KeystoneRegion}
+          service: 'network'
       monitoring_subscription: {get_param: MonitoringSubscriptionNeutronServer}
       config_settings:
         map_merge:
@@ -240,6 +266,7 @@ outputs:
             neutron::keystone::authtoken::auth_url: {get_param: [EndpointMap, KeystoneInternal, uri_no_suffix]}
             neutron::server::allow_automatic_l3agent_failover: {get_param: NeutronAllowL3AgentFailover}
             neutron::server::enable_proxy_headers_parsing: true
+            neutron::server::igmp_snooping_enable: {get_param: NeutronEnableIgmpSnooping}
             neutron::keystone::authtoken::password: {get_param: NeutronPassword}
             neutron::server::notifications::auth_url: { get_param: [ EndpointMap, KeystoneInternal, uri_no_suffix ] }
             neutron::server::notifications::tenant_name: 'service'
@@ -254,6 +281,14 @@ outputs:
             neutron::server::sync_db: true
             neutron::server::notifications::region_name: {get_param: KeystoneRegion}
             neutron::server::placement::region_name: {get_param: KeystoneRegion}
+            neutron::server::placement::password: {get_param: NovaPassword}
+            neutron::server::placement::www_authenticate_uri: {get_param: [EndpointMap, KeystoneInternal, uri_no_suffix]}
+            neutron::server::placement::project_domain_name: 'Default'
+            neutron::server::placement::project_name: 'service'
+            neutron::server::placement::user_domain_name: 'Default'
+            neutron::server::placement::username: nova
+            neutron::server::placement::auth_url: {get_param: [EndpointMap, KeystoneInternal, uri_no_suffix]}
+            neutron::server::placement::auth_type: 'password'
             tripleo::neutron_api::firewall_rules:
               '114 neutron api':
                 dport:
@@ -357,13 +392,6 @@ outputs:
         rsyslog:
           tripleo_logging_sources_neutron_api:
             - {get_param: NeutronApiLoggingSource}
-        keystone:
-          neutron::keystone::auth::tenant: 'service'
-          neutron::keystone::auth::public_url: {get_param: [EndpointMap, NeutronPublic, uri]}
-          neutron::keystone::auth::internal_url: { get_param: [ EndpointMap, NeutronInternal, uri ] }
-          neutron::keystone::auth::admin_url: { get_param: [ EndpointMap, NeutronAdmin, uri ] }
-          neutron::keystone::auth::password: {get_param: NeutronPassword}
-          neutron::keystone::auth::region: {get_param: KeystoneRegion}
         mysql:
           neutron::db::mysql::password: {get_param: NeutronPassword}
           neutron::db::mysql::user: neutron
@@ -372,16 +400,6 @@ outputs:
           neutron::db::mysql::allowed_hosts:
             - '%'
             - "%{hiera('mysql_bind_host')}"
-        placement:
-          neutron::server::placement::www_authenticate_uri: {get_param: [EndpointMap, KeystoneInternal, uri_no_suffix]}
-          neutron::server::placement::project_domain_name: 'Default'
-          neutron::server::placement::project_name: 'service'
-          neutron::server::placement::user_domain_name: 'Default'
-          neutron::server::placement::password: {get_param: NovaPassword}
-          neutron::server::placement::username: nova
-          neutron::server::placement::auth_url: {get_param: [EndpointMap, KeystoneInternal, uri_no_suffix]}
-          neutron::server::placement::auth_type: 'password'
-          neutron::server::placement::region_name: {get_param: KeystoneRegion}
       # BEGIN DOCKER SETTINGS
       puppet_config:
         config_volume: neutron
@@ -432,27 +450,58 @@ outputs:
               dest: "/etc/httpd/conf.d"
               merge: false
               preserve_properties: true
+      container_config_scripts:
+        map_merge:
+          - {get_attr: [ContainersCommon, container_config_scripts]}
+          - neutron_ffu_db_sync.sh:
+              mode: "0755"
+              content: { get_file: ../../container_config_scripts/neutron_ffu_db_sync.sh }
       docker_config:
         step_2:
           get_attr: [NeutronLogging, docker_config, step_2]
         step_3:
-          neutron_db_sync:
-            image: &neutron_api_image {get_param: ContainerNeutronApiImage}
-            net: host
-            privileged: false
-            detach: false
-            user: root
-            volumes:
-              list_concat:
-                - {get_attr: [ContainersCommon, volumes]}
-                - {get_attr: [NeutronLogging, volumes]}
-                -
-                  - /var/lib/config-data/neutron/etc/my.cnf.d/tripleo.cnf:/etc/my.cnf.d/tripleo.cnf:ro
-                  - /var/lib/config-data/neutron/etc/neutron:/etc/neutron:ro
-            command: ['/usr/bin/bootstrap_host_exec', 'neutron_api', 'neutron-db-manage', 'upgrade', 'heads']
-            # FIXME: we should make config file permissions right
-            # and run as neutron user
-            #command: "/usr/bin/bootstrap_host_exec neutron_api su neutron -s /bin/bash -c 'neutron-db-manage upgrade heads'"
+          map_merge:
+            - neutron_db_sync:
+                start_order: 1
+                image: &neutron_api_image {get_param: ContainerNeutronApiImage}
+                net: host
+                privileged: false
+                detach: false
+                user: root
+                volumes: &neutron_api_volumes
+                  list_concat:
+                    - {get_attr: [ContainersCommon, volumes]}
+                    - {get_attr: [NeutronLogging, volumes]}
+                    -
+                      - /var/lib/config-data/neutron/etc/my.cnf.d/tripleo.cnf:/etc/my.cnf.d/tripleo.cnf:ro
+                      - /var/lib/config-data/neutron/etc/neutron:/etc/neutron:ro
+                command: ['/usr/bin/bootstrap_host_exec', 'neutron_api', 'neutron-db-manage', 'upgrade', 'heads']
+                # FIXME: we should make config file permissions right
+                # and run as neutron user
+                #command: "/usr/bin/bootstrap_host_exec neutron_api su neutron -s /bin/bash -c 'neutron-db-manage upgrade heads'"
+                environment:
+                  TRIPLEO_DEPLOY_IDENTIFIER: {get_param: DeployIdentifier}
+            - if:
+                - fast_forward_upgrade
+                - neutron_db_sync_stein:
+                    start_order: 0
+                    image: &neutron_api_image_stein {get_param: ContainerNeutronApiImageStein}
+                    net: host
+                    privileged: false
+                    detach: false
+                    user: root
+                    volumes:
+                      list_concat:
+                        - *neutron_api_volumes
+                        -
+                          - /var/lib/container-config-scripts/:/container-config-scripts/:ro
+                    command:
+                      - '/usr/bin/bootstrap_host_exec'
+                      - 'neutron_api'
+                      - '/container-config-scripts/neutron_ffu_db_sync.sh'
+                    environment:
+                      TRIPLEO_DEPLOY_IDENTIFIER: {get_param: DeployIdentifier}
+                - {}
         step_4:
           map_merge:
             - neutron_api:
@@ -470,7 +519,7 @@ outputs:
                     - {get_param: NeutronApiOptVolumes}
                     -
                       - /var/lib/kolla/config_files/neutron_api.json:/var/lib/kolla/config_files/config.json:ro
-                      - /var/lib/config-data/puppet-generated/neutron/:/var/lib/kolla/config_files/src:ro
+                      - /var/lib/config-data/puppet-generated/neutron:/var/lib/kolla/config_files/src:ro
                     - if:
                       - ovn_and_tls
                       -
@@ -494,7 +543,7 @@ outputs:
                         - {get_attr: [NeutronLogging, volumes]}
                         -
                           - /var/lib/kolla/config_files/neutron_server_tls_proxy.json:/var/lib/kolla/config_files/config.json:ro
-                          - /var/lib/config-data/puppet-generated/neutron/:/var/lib/kolla/config_files/src:ro
+                          - /var/lib/config-data/puppet-generated/neutron:/var/lib/kolla/config_files/src:ro
                           - /etc/pki/tls/certs/httpd:/etc/pki/tls/certs/httpd:ro
                           - /etc/pki/tls/private/httpd:/etc/pki/tls/private/httpd:ro
                     environment:
@@ -528,11 +577,11 @@ outputs:
       fast_forward_upgrade_tasks:
         - when:
             - step|int == 0
-            - release == 'ocata'
+            - release == 'rocky'
           block:
             - name: Check if neutron_server is deployed
               command: systemctl is-enabled --quiet neutron-server
-              ignore_errors: True
+              failed_when: false
               register: neutron_server_enabled_result
             - name: Set fact neutron_server_enabled
               set_fact:
@@ -541,7 +590,7 @@ outputs:
           service: name=neutron-server state=stopped enabled=no
           when:
             - step|int == 1
-            - release == 'ocata'
+            - release == 'rocky'
             - neutron_server_enabled|bool
         - when:
             - step|int == 6
@@ -555,7 +604,7 @@ outputs:
               package: name=python-networking-odl state=latest
               # package python-networking-cisco may or may not be present
             - name: Networking cisco db sync workaround
-              ignore_errors: true
+              failed_when: false
               package: name=python-networking-cisco state=latest
         - name: Neutron db sync
           command: neutron-db-manage upgrade head

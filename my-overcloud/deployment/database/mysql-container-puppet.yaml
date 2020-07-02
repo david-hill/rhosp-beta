@@ -158,7 +158,7 @@ outputs:
               list_concat:
               -
                 - /var/lib/kolla/config_files/mysql.json:/var/lib/kolla/config_files/config.json
-                - /var/lib/config-data/puppet-generated/mysql/:/var/lib/kolla/config_files/src:ro
+                - /var/lib/config-data/puppet-generated/mysql:/var/lib/kolla/config_files/src:ro
                 - /etc/localtime:/etc/localtime:ro
                 - /etc/hosts:/etc/hosts:ro
                 - /var/lib/mysql:/var/lib/mysql
@@ -196,6 +196,36 @@ outputs:
             volumes: *mysql_volumes
             environment:
               KOLLA_CONFIG_STRATEGY: COPY_ALWAYS
+          mysql_neutron_db_rename:
+            start_order: 3
+            detach: false
+            image: *mysql_image
+            volumes:
+              list_concat:
+                - *mysql_volumes
+                - - /etc/ssh/ssh_known_hosts:/etc/ssh/ssh_known_hosts:ro
+                  # required for bootstrap_host_exec
+                  - /etc/puppet:/etc/puppet:ro
+                  - /var/lib/config-data/puppet-generated/mysql/root:/root:rw #provides .my.cnf for puppet, changed on password update
+            environment:
+              KOLLA_CONFIG_STRATEGY: COPY_ALWAYS
+            net: host
+            user: root
+            # Kolla bootstraps aren't idempotent, explicitly checking if bootstrap was done
+            command:
+              - 'bash'
+              - '-ec'
+              -
+                list_join:
+                  - "\n"
+                  - - 'if [ -d /var/lib/mysql/neutron ] ; then'
+                    - 'mysql -e "CREATE DATABASE IF NOT EXISTS \`ovs_neutron\`;"'
+                    - 'for table in `mysql -B -N -e "SHOW TABLES;" neutron`'
+                    - 'do'
+                    - 'mysql -e "RENAME TABLE \`neutron\`.\`$table\` to \`ovs_neutron\`.\`$table\`"'
+                    - 'done'
+                    - 'mysql -e "DROP DATABASE \`neutron\`;"'
+                    - 'fi'
         step_3:
           # sync credentials config on the running container if it was
           # changed by the docker_puppet_task during step 2
@@ -240,17 +270,10 @@ outputs:
             path: "{{ item.path }}"
             state: directory
             setype: "{{ item.setype }}"
+            mode: "{{ item.mode|default(omit) }}"
           with_items:
-            - {'path': /var/log/containers/mysql, 'setype': 'svirt_sandbox_file_t'}
+            - {'path': /var/log/containers/mysql, 'setype': 'svirt_sandbox_file_t', 'mode': '0750'}
             - {'path': /var/lib/mysql, 'setype': 'svirt_sandbox_file_t'}
-            - {'path': /var/log/mariadb, 'setype': 'svirt_sandbox_file_t'}
-        - name: mysql logs readme
-          copy:
-            dest: /var/log/mariadb/readme.txt
-            content: |
-              Log files from mysql containers can be found under
-              /var/log/containers/mysql.
-          ignore_errors: true
       upgrade_tasks:
           # LP 1810136
           # After upgrade, the new mariadb (e.g. 10.3) might not be able
@@ -321,7 +344,7 @@ outputs:
       fast_forward_upgrade_tasks:
         - when:
             - step|int == 6
-            - release == 'ocata'
+            - release == 'rocky'
             - is_bootstrap_node|bool
           block:
             - name: Remove whitespaces in .my.cnf

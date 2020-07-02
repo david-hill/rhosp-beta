@@ -6,7 +6,6 @@ resource_registry:
   OS::TripleO::Network::Ports::OVNDBsVipPort: ../network/ports/noop.yaml
   OS::TripleO::Network::Ports::ControlPlaneVipPort: ../deployed-server/deployed-neutron-port.yaml
   OS::TripleO::Standalone::Net::SoftwareConfig: ../net-config-standalone.yaml
-  OS::TripleO::NodeExtraConfigPost: ../extraconfig/post_deploy/standalone_post.yaml
 
   OS::TripleO::Services::OpenStackClients: ../deployment/clients/openstack-clients-baremetal-puppet.yaml
 
@@ -79,6 +78,8 @@ resource_registry:
   OS::TripleO::Services::MistralEngine: OS::Heat::None
   OS::TripleO::Services::MistralEventEngine: OS::Heat::None
   OS::TripleO::Services::MistralExecutor: OS::Heat::None
+  # Panko
+  OS::TripleO::Services::PankoApi: OS::Heat::None
   # Sahara
   OS::TripleO::Services::SaharaApi: OS::Heat::None
   OS::TripleO::Services::SaharaEngine: OS::Heat::None

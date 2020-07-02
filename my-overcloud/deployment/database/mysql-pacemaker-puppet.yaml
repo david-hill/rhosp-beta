@@ -10,6 +10,14 @@ parameters:
   ContainerMysqlConfigImage:
     description: The container image to use for the mysql config_volume
     type: string
+  ClusterCommonTag:
+    default: false
+    description: When set to false, a pacemaker service is configured
+                 to use a floating tag for its container image name,
+                 e.g. 'REGISTRY/NAMESPACE/IMAGENAME:pcmklatest'. When
+                 set to true, the service uses a floating prefix as
+                 well, e.g. 'cluster.common.tag/IMAGENAME:pcmklatest'.
+    type: boolean
   EndpointMap:
     default: {}
     description: Mapping of service endpoint -> protocol. Typically set
@@ -93,6 +101,7 @@ conditions:
   puppet_debug_enabled: {get_param: ConfigDebug}
   internal_tls_enabled: {equals: [{get_param: EnableInternalTLS}, true]}
   docker_enabled: {equals: [{get_param: ContainerCli}, 'docker']}
+  common_tag_enabled: {equals: [{get_param: ClusterCommonTag}, true]}
 
 outputs:
   role_data:
@@ -123,12 +132,15 @@ outputs:
             tripleo::profile::pacemaker::database::mysql::ca_file:
               get_param: InternalTLSCAFile
             tripleo::profile::pacemaker::database::mysql_bundle::mysql_docker_image: &mysql_image_pcmklatest
-              list_join:
-                - ':'
-                - - yaql:
-                      data: {get_param: ContainerMysqlImage}
-                      expression: $.data.rightSplit(separator => ":", maxSplits => 1)[0]
-                  - 'pcmklatest'
+              yaql:
+                data:
+                  if:
+                    - common_tag_enabled
+                    - yaql:
+                        data: {get_param: ContainerMysqlImage}
+                        expression: concat("cluster.common.tag/", $.data.rightSplit(separator => "/", maxSplits => 1)[1])
+                    - {get_param: ContainerMysqlImage}
+                expression: concat($.data.rightSplit(separator => ":", maxSplits => 1)[0], ":pcmklatest")
             tripleo::profile::pacemaker::database::mysql_bundle::control_port: 3123
             tripleo::profile::pacemaker::database::mysql_bundle::container_backend: {get_param: ContainerCli}
             tripleo::mysql::firewall_rules:
@@ -228,13 +240,14 @@ outputs:
                     - 'timeout ${DB_MAX_TIMEOUT} /bin/bash -c ''until mysqladmin -uroot -p"${DB_ROOT_PASSWORD}" ping 2>/dev/null; do sleep 1; done'''
                     - 'mysql -uroot -p"${DB_ROOT_PASSWORD}" -e "CREATE USER ''clustercheck''@''localhost'' IDENTIFIED BY ''${DB_CLUSTERCHECK_PASSWORD}'';"'
                     - 'mysql -uroot -p"${DB_ROOT_PASSWORD}" -e "GRANT PROCESS ON *.* TO ''clustercheck''@''localhost'' WITH GRANT OPTION;"'
+                    - 'mysql -uroot -p"${DB_ROOT_PASSWORD}" -e "DELETE FROM mysql.user WHERE user = ''root'' AND host NOT IN (''%'',''localhost'');"'
                     - 'timeout ${DB_MAX_TIMEOUT} mysqladmin -uroot -p"${DB_ROOT_PASSWORD}" shutdown'
             volumes: &mysql_volumes
               list_concat:
                 - {get_attr: [ContainersCommon, volumes]}
                 -
                   - /var/lib/kolla/config_files/mysql.json:/var/lib/kolla/config_files/config.json:rw,z
-                  - /var/lib/config-data/puppet-generated/mysql/:/var/lib/kolla/config_files/src:ro,z
+                  - /var/lib/config-data/puppet-generated/mysql:/var/lib/kolla/config_files/src:ro,z
                   - /var/lib/mysql:/var/lib/mysql:rw,z
             environment:
               KOLLA_CONFIG_STRATEGY: COPY_ALWAYS
@@ -249,23 +262,8 @@ outputs:
                       - {get_param: MysqlRootPassword}
                       - {get_param: [DefaultPasswords, mysql_root_password]}
         step_2:
-          mysql_restart_bundle:
-            start_order: 0
-            config_volume: mysql
-            detach: false
-            net: host
-            ipc: host
-            user: root
-            environment:
-              TRIPLEO_MINOR_UPDATE: ''
-            command: /pacemaker_restart_bundle.sh galera-bundle mysql
-            image: {get_param: ContainerMysqlImage}
-            volumes:
-              list_concat:
-                - {get_attr: [ContainersCommon, pacemaker_restart_volumes]}
-                - - /var/lib/config-data/puppet-generated/mysql/:/var/lib/kolla/config_files/src:ro
           mysql_init_bundle:
-            start_order: 1
+            start_order: 0
             detach: false
             net: host
             ipc: host
@@ -294,23 +292,32 @@ outputs:
               # NOTE: this should force this container to re-run on each
               # update (scale-out, etc.)
               TRIPLEO_DEPLOY_IDENTIFIER: {get_param: DeployIdentifier}
+          mysql_restart_bundle:
+            start_order: 1
+            config_volume: mysql
+            detach: false
+            net: host
+            ipc: host
+            user: root
+            environment:
+              TRIPLEO_MINOR_UPDATE: ''
+            command: /pacemaker_restart_bundle.sh mysql galera galera-bundle Master
+            image: {get_param: ContainerMysqlImage}
+            volumes:
+              list_concat:
+                - {get_attr: [ContainersCommon, pacemaker_restart_volumes]}
+                - - /var/lib/config-data/puppet-generated/mysql:/var/lib/kolla/config_files/src:ro
       host_prep_tasks:
         - name: create persistent directories
           file:
             path: "{{ item.path }}"
             state: directory
             setype: "{{ item.setype }}"
+            mode: "{{ item.mode|default(omit) }}"
           with_items:
-            - {'path': /var/log/containers/mysql, 'setype': 'svirt_sandbox_file_t'}
+            - {'path': /var/log/containers/mysql, 'setype': 'svirt_sandbox_file_t', 'mode': '0750'}
             - {'path': /var/lib/mysql, 'setype': 'svirt_sandbox_file_t'}
-            - {'path': /var/log/mariadb, 'setype': 'svirt_sandbox_file_t'}
-        - name: mysql logs readme
-          copy:
-            dest: /var/log/mariadb/readme.txt
-            content: |
-              Log files from mysql containers can be found under
-              /var/log/containers/mysql.
-          ignore_errors: true
+            - {'path': /var/log/mariadb, 'setype': 'svirt_sandbox_file_t', 'mode': '0750'}
       metadata_settings:
         get_attr: [MysqlBase, role_data, metadata_settings]
       deploy_steps_tasks:
@@ -346,19 +353,6 @@ outputs:
                 container_image: "{{galera_image}}"
                 container_image_latest: "{{galera_image_latest}}"
               when:
-                - old_galera_image_id.stdout != new_galera_image_id.stdout
-            - block:
-                - name: Get a list of container using galera image
-                  shell: "{{container_cli}} ps -a -q -f 'ancestor={{old_galera_image_id.stdout}}'"
-                  register: galera_containers_to_destroy
-                # It will be recreated with the delpoy step.
-                - name: Remove any container using the same galera image
-                  shell: "{{container_cli}} rm -fv {{item}}"
-                  with_items: "{{ galera_containers_to_destroy.stdout_lines }}"
-                - name: Remove previous galera images
-                  shell: "{{container_cli}} rmi -f {{old_galera_image_id.stdout}}"
-              when:
-                - old_galera_image_id.stdout != ''
                 - old_galera_image_id.stdout != new_galera_image_id.stdout
 
       upgrade_tasks:
@@ -452,7 +446,7 @@ outputs:
               block:
                 - name: Check Mysql logging configuration in pacemaker
                   command: cibadmin --query --xpath "//storage-mapping[@id='mysql-log']"
-                  ignore_errors: true
+                  failed_when: false
                   register: mysql_logs_moved
                 - name: Change Mysql logging configuration in pacemaker
                   # rc == 6 means the configuration doesn't exist in the CIB
@@ -475,6 +469,7 @@ outputs:
         - name: Create hiera data to upgrade mysql in a stepwise manner.
           when:
             - step|int == 1
+            - cluster_recreate|bool
           block:
             - name: set mysql upgrade node facts in a single-node environment
               set_fact:
@@ -489,11 +484,8 @@ outputs:
                 cacheable: no
               when:
                 - groups['mysql'] | length > 1
-                - item.split('.')[0] in ansible_limit.split(',')
+                - item.split('.')[0] in ansible_limit.split(':')
               loop: "{{ mysql_node_names }}"
-
-            - debug:
-                msg: "Prepare galera upgrade for {{ mysql_short_node_names_upgraded }}"
             - fail:
                 msg: >
                   You can't upgrade galera without staged upgrade.
@@ -503,13 +495,16 @@ outputs:
                 mysql_short_node_names_upgraded | length == 0 or
                 mysql_node_names_upgraded is not defined or
                 mysql_node_names_upgraded | length == 0
-
+            - debug:
+                msg: "Prepare galera upgrade for {{ mysql_short_node_names_upgraded }}"
             - name: remove mysql init container on upgrade-scaleup to force re-init
-              shell: |
-                if podman inspect mysql_init_bundle &> /dev/null; then
-                    podman rm mysql_init_bundle
-                fi
-              when: mysql_short_node_names_upgraded | length > 1
+              include_role:
+                name: tripleo-container-rm
+              vars:
+                tripleo_containers_to_rm:
+                  - mysql_init_bundle
+              when:
+                - mysql_short_node_names_upgraded | length > 1
             - name: add the mysql short name to hiera data for the upgrade.
               include_role:
                 name: tripleo-upgrade-hiera
@@ -595,6 +590,24 @@ outputs:
                     LOG_DIR: '/var/log/containers/mysql'
 
       external_upgrade_tasks:
+        # https://bugs.launchpad.net/tripleo/+bug/1753247
+        # OC pacemaker part, UC or non pacemaker part is in deployment steps
+        - name: Rename old neutron database to ovs_neutron
+          shell: >
+            if [ -d /var/lib/mysql/neutron ] ; then
+              mysql -e "CREATE DATABASE IF NOT EXISTS \`ovs_neutron\`;"
+              for table in `mysql -B -N -e "SHOW TABLES;" neutron`
+                do
+                  mysql -e "RENAME TABLE \`neutron\`.\`$table\` to \`ovs_neutron\`.\`$table\`"
+                done
+              mysql -e "DROP DATABASE \`neutron\`;"
+            fi
+          become: true
+          tags:
+            - never
+            - system_upgrade_stop_services
+          when:
+            - step|int == 2
         - vars:
             mysql_upgrade_transfer: {get_param: MysqlUpgradeTransfer}
           when:
@@ -617,7 +630,7 @@ outputs:
       fast_forward_upgrade_tasks:
         - when:
             - step|int == 6
-            - release == 'ocata'
+            - release == 'rocky'
             - is_bootstrap_node|bool
           block:
             - name: Remove whitespaces in .my.cnf
