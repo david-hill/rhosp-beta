@@ -3,7 +3,6 @@
 # by the operator. Please use additional -e env.yaml.
 parameter_defaults:
   EnablePackageInstall: false
-  UpgradeLevelNovaCompute: ''
   UpgradeInitCommonCommand: ''
   UpgradeInitCommand: ''
   # FFU params
@@ -24,5 +23,9 @@ parameter_defaults:
   ContainerCeph3DaemonImage: ''
   # Unset operating system upgrade
   UpgradeLeappEnabled: false
+  UpgradeLeappDevelSkip: ''
   UpgradeLeappToInstall: []
   UpgradeLeappToRemove: []
+  # After the upgrade converge the ceph upgrade starts.
+  # We need to reset the ceph-ansible repo validations.
+  CephAnsibleWarning: true
